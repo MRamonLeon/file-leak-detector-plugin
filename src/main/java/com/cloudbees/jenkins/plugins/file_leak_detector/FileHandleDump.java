@@ -26,6 +26,8 @@ import org.kohsuke.stapler.interceptor.RequirePOST;
  */
 @Extension
 public class FileHandleDump extends ManagementLink {
+    private static Object fileLeadDetectorLock = new Object();
+
     public String getIconFileName() {
         return "help.png";
     }
@@ -81,23 +83,44 @@ public class FileHandleDump extends ManagementLink {
             .add(PosixAPI.jnr().getpid())
             .add(Util.fixEmpty(opts));
 
-        Process p = new ProcessBuilder(args.toCommandArray())
-                .redirectErrorStream(true)
-                .start();
+        // Avoid that a second thread assigns to the oldSecurityManager the new one established by the first thread
+        // which will end up in the SecurityManager restored at the end being the new one, not the original. And
+        // therefore won't be any way to finish Jenkins because the checkExit of the restored Security Manager is
+        // avoiding it. Even with the if (loadListener() != null) a second thread could enter here before the first one
+        // set the listener, when they both are in the if (loadListener() != null) being it yet null.
+        synchronized (fileLeadDetectorLock) {
+            // Create a Security Manager to catch the System.exit from the process. This Security Manager delegates in
+            // the old one, except the checkExit method.
+            SecurityManager oldSecurityManager = System.getSecurityManager();
 
-        p.getOutputStream().close();
+            if (oldSecurityManager == null) {
+                // Allow all except the exit
+                System.setSecurityManager(new AvoidExitSecurityManager());
+            } else {
+                // Delegate to the old security manager except the exit
+                System.setSecurityManager(new AvoidExitAndDelegateSecurityManager(oldSecurityManager));
+            }
 
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        IOUtils.copy(p.getInputStream(),baos);
-        IOUtils.closeQuietly(p.getInputStream());
-        IOUtils.closeQuietly(p.getErrorStream());
+            Process p = new ProcessBuilder(args.toCommandArray())
+                    .redirectErrorStream(true)
+                    .start();
 
-        int exitCode = p.waitFor();
+            p.getOutputStream().close();
 
-        if (exitCode!=0)
-            throw new Error("Failed to activate file leak detector: "+baos);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            IOUtils.copy(p.getInputStream(),baos);
+            IOUtils.closeQuietly(p.getInputStream());
+            IOUtils.closeQuietly(p.getErrorStream());
 
-        return HttpResponses.plainText("Successfully activated file leak detector");
+            p.waitFor();
+
+            // Restore the former Security Manager
+            System.setSecurityManager(oldSecurityManager);
+
+            // We don't know whether there was an error or not, so just output the response, without assuming success or
+            // failure
+            return HttpResponses.plainText("Activated file leak detector. Output: \n" + baos.toString("UTF-8"));
+        }
     }
 
     /**
